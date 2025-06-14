@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+python-multipart
+PyPDF2
+pdfplumber
+python-docx
+pydantic
+langchain_ollama
+ollama
+llama-cloud-services
