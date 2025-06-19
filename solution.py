@@ -12,6 +12,8 @@ import traceback
 import tempfile
 import asyncio
 import re
+import subprocess
+
 # For qwen3 via Ollama
 from langchain_ollama import ChatOllama
 
@@ -52,50 +54,62 @@ class JobDescription(BaseModel):
 
 file_storage: Dict[str, str] = {}
 
-def get_llm():
-    return ChatOllama(model="qwen3", temperature=0)
+def get_llm(format='none'):
+    return ChatOllama(model="llama3.2", temperature=0,format=format)
 
-def extract_resume_data_from_md(md_text: str) -> ResumeData:
-    llm = get_llm()
+def extract_json_from_response(response_text):
+    # Try strict fenced block first
+    match = re.search(r'```json\s*(\{[\s\S]*?\})\s*```', response_text)
+    if match:
+        return match.group(1)
+    # Try loose: find the first { ... } block (may still be fragile)
+    json_blocks = list(re.finditer(r'(\{[\s\S]*?\})', response_text))
+    if json_blocks:
+        # Optionally, pick the longest block
+        return max(json_blocks, key=lambda m: len(m.group(1))).group(1)
+    raise ValueError("No valid JSON block found in LLM response.")
+
+async def extract_resume_data_from_md(md_text: str) -> ResumeData:
+    llm = get_llm(format='json')
+    if llm is None:
+        raise ValueError("LLM not initialized. Check your environment and API key.")
+    
     system_prompt = (
-    "You are a resume parsing assistant. Given a Markdown version of a resume, "
-    "convert it into a structured JSON object using the **exact** schema below:\n\n"
-    "**ResumeData schema:**\n"
-    "- name: string\n"
-    "- email: string\n"
-    "- phone: string\n"
-    "- summary: string or null\n"
-    "- work_experience: list of {title, company, dates, description}\n"
-    "- education: list of {school, degree, dates}\n"
-    "- skills: list of strings\n"
-    "- projects: list of {name, description}\n"
-    "- certifications: list of strings\n"
-    "- other: list of {label, content}\n\n"
-    "⚠️ Output only a complete and valid JSON object. No extra explanation. No commentary. No Markdown headings.\n"
-    "Wrap the output *only* inside triple backticks with a `json` tag, like this:\n"
-    "```json\n{\n  ...\n}\n```"
-)
+        "You are a resume parsing assistant. Given a Markdown version of a resume, "
+        "convert it into a structured JSON object using the **exact** schema below:\n\n"
+        "**ResumeData schema:**\n"
+        "- name: string\n"
+        "- email: string\n"
+        "- phone: string\n"
+        "- summary: string or null\n"
+        "- work_experience: list of {title, company, dates, description}\n"
+        "- education: list of {school, degree, dates}\n"
+        "- skills: list of strings\n"
+        "- projects: list of {name, description}\n"
+        "- certifications: list of strings\n"
+        "- other: list of {label, content}\n\n"
+        "⚠️ Output only a complete and valid JSON object. No extra explanation. No commentary. No Markdown headings. no code fences\n"
+    )
 
     user_prompt = f"Here is the Markdown resume:\n\n{md_text}"
-
-    ai_msg = llm.invoke([
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_prompt}
-    ])
-
-    response_text = getattr(ai_msg, "content", str(ai_msg)).strip()
-
-    # Try extracting first JSON block in case LLM adds extra commentary
-    match = re.search(r'```json\s*(\{[\s\S]*?\})\s*```', response_text)
-    if not match:
-        raise ValueError("No valid JSON block found in LLM response.")
-    json_text = match.group(1)
-
     try:
-        parsed_json = json.loads(json_text)
-        return ResumeData.model_validate(parsed_json)
+        ai_msg = await asyncio.to_thread(llm.invoke, [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt}
+        ])
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to parse JSON: {e}\nRaw JSON block:\n{json_text}")
+        raise HTTPException(status_code=500, detail=f"LLM invocation failed: {e}")
+    
+    response_text = getattr(ai_msg, "content", str(ai_msg)).strip()
+    return ResumeData.model_validate_json(response_text)
+    # print("[DEBUG] Raw LLM response from extract_resume_data_from_md:\n", response_text)
+    # json_text = extract_json_from_response(response_text)
+    # try:
+    #     parsed_json = json.loads(json_text)
+    #     return ResumeData.model_validate(parsed_json)
+    # except Exception as e:
+    #     print(f"[ERROR] JSON parsing failed. Full LLM output:\n{response_text}")
+    #     raise HTTPException(status_code=500, detail=f"Failed to parse JSON: {e}\nRaw JSON block:\n{json_text}")
 
 # ✅ ASYNC version of parse_resume_with_llama
 async def parse_resume_with_llama(file_bytes: bytes, filename: str) -> ResumeData:
@@ -111,10 +125,10 @@ async def parse_resume_with_llama(file_bytes: bytes, filename: str) -> ResumeDat
         parsed_obj = await asyncio.to_thread(parser.parse, tmp_path)
 
         markdown_resume = parsed_obj.get_markdown_documents(split_by_page=True)
-        print("[DEBUG] LlamaParse response:", markdown_resume)
+        # print("[DEBUG] LlamaParse response:", markdown_resume)
         print("[DEBUG] parsed_obj type:", type(markdown_resume))
 
-        print("[DEBUG] .md preview:", markdown_resume[:200])
+        # print("[DEBUG] .md preview:", markdown_resume[:200])
         try:
             os.remove(tmp_path)
             print("[DEBUG] Temporary file removed:", tmp_path)
@@ -123,7 +137,10 @@ async def parse_resume_with_llama(file_bytes: bytes, filename: str) -> ResumeDat
 
         # Now use your LLM to convert markdown to structured ResumeData
         print("[DEBUG] Converting markdown to ResumeData via LLM...")
-        dataFromLLM = extract_resume_data_from_md(markdown_resume)
+        print("[DEBUG] Number of markdown pages:", len(markdown_resume)) 
+        # Join markdown from all pages into a single string
+        combined_md = "\n\n".join(doc.text_resource.text for doc in markdown_resume if doc.text_resource and doc.text_resource.text)
+        dataFromLLM = await extract_resume_data_from_md(combined_md)
         print("[DEBUG] LLM response:\n", dataFromLLM)
         return dataFromLLM
 
@@ -133,9 +150,9 @@ async def parse_resume_with_llama(file_bytes: bytes, filename: str) -> ResumeDat
         raise HTTPException(status_code=500, detail=f"LlamaParse failed: {e}")
 
 
-def analyze_job_description(text: str) -> JobDescription:
+async def analyze_job_description(text: str) -> JobDescription:
     print("[DEBUG] Analyzing job description text:", text[:500])
-    llm = get_llm()
+    llm = get_llm(format='json')
 
     system_prompt = (
         "You are a job description analysis assistant. "
@@ -150,14 +167,20 @@ def analyze_job_description(text: str) -> JobDescription:
 
     user_prompt = f"Job description text:\n\"\"\"{text}\"\"\""
 
-    ai_msg = llm.invoke([
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_prompt}
-    ])
+    try:
+            ai_msg = await asyncio.to_thread(
+                llm.invoke,
+                [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt}
+                ]
+            )
+    except Exception as e:
+            raise HTTPException(status_code=500, detail=f"LLM invoke failed: {e}")
 
     # Safely extract raw string
     response_text = getattr(ai_msg, "content", str(ai_msg)).strip()
-    print("[DEBUG] Raw LLM response:\n", response_text[:300])
+    print("[DEBUG] Raw LLM response:\n", response_text)
 
     # Strip markdown code block wrappers if present
     cleaned = (
@@ -187,31 +210,85 @@ def analyze_job_description(text: str) -> JobDescription:
 
 
 
-def generate_tailored_resume(resume_data: ResumeData, job_description: JobDescription) -> str:
-    llm = get_llm()
+def generate_tailored_resume_latex(resume_data: ResumeData, job_description: JobDescription) -> str:
+    llm = get_llm('')
     system_prompt = (
-        "You are a resume generator. Given JSON of user resume data and JSON of job description data, "
-        "produce a tailored resume in Markdown format. "
-        "Structure with headings: Name & Contact, Summary, Skills, Experience, Education, Projects, Certifications, Other. "
-        "Emphasize alignment: reorder or rephrase bullet points to match required_skills and responsibilities, "
-        "highlight metrics if present. Output only the Markdown text."
+    "You are a resume generator that outputs only LaTeX code. "
+    "Generate a professional resume using the LaTeX article class. "
+    "The resume must include the following sections using \\section*{}: "
+    "Name & Contact, Summary, Skills, Work Experience, Education, Projects, Certifications, and Other. "
+    "Use \\begin{itemize}...\\end{itemize} for bullet points. "
+    "Tailor the content to the job description’s required skills and responsibilities. "
+    "Emphasize relevant experience using concise, quantifiable language. "
+    "Do not include explanations, code blocks, markdown, or commentary. "
+    "Only return the raw LaTeX code starting with \\documentclass.\n\n"
+    "Here is a LaTeX resume skeleton you must use as the format:\n\n"
+    "\\documentclass[letterpaper,11pt]{article}\n"
+    "\\usepackage[utf8]{inputenc}\n"
+    "\\usepackage[empty]{fullpage}\n"
+    "\\usepackage{hyperref}\n"
+    "\\usepackage{enumitem}\n"
+    "\\usepackage{titlesec}\n"
+    "\\usepackage{fancyhdr}\n"
+    "\\usepackage[dvipsnames]{xcolor}\n"
+    "\\usepackage{tabularx}\n"
+    "\\usepackage[english]{babel}\n"
+    "\\input{glyphtounicode}\n"
+    "\\pagestyle{fancy}\n"
+    "\\fancyhf{}\n"
+    "\\renewcommand{\\headrulewidth}{0pt}\n"
+    "\\renewcommand{\\footrulewidth}{0pt}\n"
+    "\\addtolength{\\oddsidemargin}{-0.5in}\n"
+    "\\addtolength{\\evensidemargin}{-0.5in}\n"
+    "\\addtolength{\\textwidth}{1in}\n"
+    "\\addtolength{\\topmargin}{-.5in}\n"
+    "\\addtolength{\\textheight}{1in}\n"
+    "\\setlength{\\tabcolsep}{0in}\n"
+    "\\urlstyle{same}\n"
+    "\\raggedright\n"
+    "\\raggedbottom\n"
+    "\\titleformat{\\section}{\\large\\scshape}{}{0pt}{}\n"
+    "\\titlespacing{\\section}{0pt}{4pt}{4pt}\n"
+    "\\pdfgentounicode=1\n"
+    "\\newcommand{\\resumeItem}[1]{\\item\\small{#1}}\n"
+    "\\newcommand{\\resumeSubheading}[4]{%\n"
+    "  \\vspace{1pt}\\item\n"
+    "  \\begin{tabular*}{0.97\\textwidth}[t]{l@{\\extracolsep{\\fill}}r}\n"
+    "    \\textbf{#1} & \\textbf{#2} \\\\\n"
+    "    \\textit{\\small #3} & \\textit{\\small #4}\n"
+    "  \\end{tabular*}\\vspace{-4pt}}\n"
+    "\\newcommand{\\resumeSubHeadingListStart}{\\begin{itemize}[leftmargin=0.15in,label={}]} \n"
+    "\\newcommand{\\resumeSubHeadingListEnd}{\\end{itemize}} \n"
+    "\\newcommand{\\resumeItemListStart}{\\begin{itemize}[leftmargin=*]} \n"
+    "\\newcommand{\\resumeItemListEnd}{\\end{itemize}\\vspace{-4pt}}\n"
+    "\\begin{document}\n"
+    "% Fill in the sections with tailored content.\n"
+    "\\end{document}"
     )
+
+
     payload = {
-        "resume": resume_data.dict(),
-        "job": job_description.dict()
+        "resume": resume_data.model_dump(),
+        "job": job_description.model_dump()
     }
+
     user_prompt = (
         "User resume JSON:\n" + json.dumps(payload["resume"], indent=2) +
         "\n\nJob description JSON:\n" + json.dumps(payload["job"], indent=2)
     )
+
     ai_msg = llm.invoke([
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_prompt}
     ])
+    print("[DEBUG] LLM raw response:", ai_msg)
+
+
     return getattr(ai_msg, "content", str(ai_msg))
 
+
 def generate_cover_letter(resume_data: ResumeData, job_description: JobDescription) -> str:
-    llm = get_llm()
+    llm = get_llm('')
     system_prompt = (
         "You are a cover letter writer. Given JSON of user resume data and JSON of job description data, "
         "write a personalized cover letter in Markdown or plain text. "
@@ -266,29 +343,27 @@ async def generate_resume_and_cover_letter(
         print("[DEBUG] parse_resume_with_llama succeeded:", resume_data)
 
         print("[DEBUG] Calling analyze_job_description")
-        jd_data = analyze_job_description(job_description)
+        jd_data = await analyze_job_description(job_description)
         print("[DEBUG] analyze_job_description succeeded:", jd_data)
 
-        print("[DEBUG] Calling generate_tailored_resume")
-        tailored_md = generate_tailored_resume(resume_data, jd_data)
-        print("[DEBUG] tailored resume preview:\n", tailored_md[:200])
+        print("[DEBUG] Calling generate_tailored_resume_latex")
+        latex_resume_code = generate_tailored_resume_latex(resume_data, jd_data)
+
+        ts = datetime.now().strftime('%Y%m%d%H%M%S')
+        resume_pdf_path = compile_latex_to_pdf(latex_resume_code, f"resume_{ts}")
+        print("[DEBUG] Resume PDF generated at:", resume_pdf_path)
 
         print("[DEBUG] Calling generate_cover_letter")
         cover_md = generate_cover_letter(resume_data, jd_data)
-        print("[DEBUG] cover letter preview:\n", cover_md[:200])
+        print("[DEBUG] Cover letter preview:\n", cover_md[:200])
 
-        ts = datetime.now().strftime('%Y%m%d%H%M%S')
-        resume_fn = f"resume_{ts}.md"
         cover_fn = f"cover_letter_{ts}.md"
-        resume_path_out = os.path.join(OUTPUT_DIR, resume_fn)
         cover_path_out = os.path.join(OUTPUT_DIR, cover_fn)
-        with open(resume_path_out, 'w') as f:
-            f.write(tailored_md)
         with open(cover_path_out, 'w') as f:
             f.write(cover_md)
 
         return {
-            'resume_download_url': f"/download-resume?file={resume_fn}",
+            'resume_pdf_download_url': f"/download-resume?file={os.path.basename(resume_pdf_path)}",
             'cover_letter_download_url': f"/download-cover-letter?file={cover_fn}"
         }
     except HTTPException:
@@ -297,6 +372,26 @@ async def generate_resume_and_cover_letter(
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Internal error: {e}")
 
+def compile_latex_to_pdf(latex_code: str, filename_prefix: str) -> str:
+    os.makedirs(OUTPUT_DIR, exist_ok=True)  # Ensure the output directory exists
+
+    tex_filename = f"{filename_prefix}.tex"
+    pdf_filename = f"{filename_prefix}.pdf"
+    tex_path = os.path.join(OUTPUT_DIR, tex_filename)
+    pdf_path = os.path.join(OUTPUT_DIR, pdf_filename)
+
+    with open(tex_path, 'w', encoding='utf-8') as f:
+        f.write(latex_code)
+
+    try:
+        subprocess.run(
+            ['pdflatex', '-interaction=nonstopmode', '-output-directory', OUTPUT_DIR, tex_path],
+            check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+        )
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(f"LaTeX compilation failed: {e.stderr.decode()}")
+
+    return pdf_path
 @app.get('/download-resume')
 async def download_resume(file: str):
     path = os.path.join(OUTPUT_DIR, file)
